@@ -168,7 +168,13 @@
           });
       };
 
-      devShells.default = pkgs.mkShell {
+      devShells.default = pkgs.callPackage ./nix/shell.nix {
+        inherit (pkgs.darwun.apple_sdk.frameworks) CoreFoundation;
+        checks = self.checks.${system};
+        inherit (nixpkgs) lib;
+        inherit rustFlagsEnv;
+      };
+      devShells.dfault = pkgs.mkShell {
         inputsFrom = builtins.attrValues self.checks.${system};
         nativeBuildInputs = with pkgs;
           [lld_13 cargo-flamegraph rust-analyzer]
