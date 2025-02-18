@@ -3,6 +3,10 @@
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
+
+    # <https://github.com/nix-systems/nix-systems>
+    systems.url = "github:nix-systems/default-linux";
+
     flake-utils.url = "github:numtide/flake-utils";
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
@@ -17,59 +21,75 @@
     crane,
     flake-utils,
     rust-overlay,
+    systems,
     ...
-  }:
+  }: let
+    inherit (nixpkgs) lib;
+    eachSystem = lib.genAttrs (import systems);
+    pkgsFor = eachSystem (system:
+      import nixpkgs {
+        localSystem = system;
+        overlays = with self.overlays; [
+          hyprland-packages
+          hyprland-extras
+        ];
+      });
+    mkRootPath = rel:
+      builtins.path {
+        path = "${toString ./.}/${rel}";
+        name = rel;
+      };
+
+    filteredSource = let
+      pathsToIgnore = [
+        ".envrc"
+        ".ignore"
+        ".github"
+        ".gitignore"
+        "logo_dark.svg"
+        "logo_light.svg"
+        "rust-toolchain.toml"
+        "rustfmt.toml"
+        "runtime"
+        "screenshot.png"
+        "book"
+        "docs"
+        "README.md"
+        "CHANGELOG.md"
+        "shell.nix"
+        "default.nix"
+        "nix/grammars.nix"
+        "nix/package.nix"
+        "nix/shell.nix"
+        "flake.nix"
+        "flake.lock"
+      ];
+      ignorePaths = path: type: let
+        inherit (nixpkgs) lib;
+        # split the nix store path into its components
+        components = lib.splitString "/" path;
+        # drop off the `/nix/hash-source` section from the path
+        relPathComponents = lib.drop 4 components;
+        # reassemble the path components
+        relPath = lib.concatStringsSep "/" relPathComponents;
+      in
+        lib.all (p: ! (lib.hasPrefix p relPath)) pathsToIgnore;
+    in
+      builtins.path {
+        name = "helix-source";
+        path = toString ./.;
+        # filter out unnecessary paths
+        filter = ignorePaths;
+      };
+  in
     flake-utils.lib.eachDefaultSystem (system: let
       pkgs = import nixpkgs {
         inherit system;
         overlays = [(import rust-overlay)];
       };
-      mkRootPath = rel:
-        builtins.path {
-          path = "${toString ./.}/${rel}";
-          name = rel;
-        };
-      filteredSource = let
-        pathsToIgnore = [
-          ".envrc"
-          ".ignore"
-          ".github"
-          ".gitignore"
-          "logo_dark.svg"
-          "logo_light.svg"
-          "rust-toolchain.toml"
-          "rustfmt.toml"
-          "runtime"
-          "screenshot.png"
-          "book"
-          "docs"
-          "README.md"
-          "CHANGELOG.md"
-          "shell.nix"
-          "default.nix"
-          "grammars.nix"
-          "flake.nix"
-          "flake.lock"
-        ];
-        ignorePaths = path: type: let
-          inherit (nixpkgs) lib;
-          # split the nix store path into its components
-          components = lib.splitString "/" path;
-          # drop off the `/nix/hash-source` section from the path
-          relPathComponents = lib.drop 4 components;
-          # reassemble the path components
-          relPath = lib.concatStringsSep "/" relPathComponents;
-        in
-          lib.all (p: ! (lib.hasPrefix p relPath)) pathsToIgnore;
-      in
-        builtins.path {
-          name = "helix-source";
-          path = toString ./.;
-          # filter out unnecessary paths
-          filter = ignorePaths;
-        };
+
       makeOverridableHelix = old: config: let
-        grammars = pkgs.callPackage ./grammars.nix config;
+        grammars = pkgs.callPackage ./nix/grammars.nix config;
         runtimeDir = pkgs.runCommand "helix-runtime" {} ''
           mkdir -p $out
           ln -s ${mkRootPath "runtime"}/* $out
@@ -173,19 +193,6 @@
         checks = self.checks.${system};
         inherit (nixpkgs) lib;
         inherit rustFlagsEnv;
-      };
-      devShells.dfault = pkgs.mkShell {
-        inputsFrom = builtins.attrValues self.checks.${system};
-        nativeBuildInputs = with pkgs;
-          [lld_13 cargo-flamegraph rust-analyzer]
-          ++ (lib.optional (stdenv.isx86_64 && stdenv.isLinux) pkgs.cargo-tarpaulin)
-          ++ (lib.optional stdenv.isLinux pkgs.lldb)
-          ++ (lib.optional stdenv.isDarwin pkgs.darwin.apple_sdk.frameworks.CoreFoundation);
-        shellHook = ''
-          export HELIX_RUNTIME="$PWD/runtime"
-          export RUST_BACKTRACE="1"
-          export RUSTFLAGS="''${RUSTFLAGS:-""} ${rustFlagsEnv}"
-        '';
       };
     })
     // {
