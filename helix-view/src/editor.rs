@@ -379,6 +379,8 @@ pub struct Config {
     /// Whether to read settings from [EditorConfig](https://editorconfig.org) files. Defaults to
     /// `true`.
     pub editor_config: bool,
+    /// Whether to render rainbow colors for matching brackets. Defaults to `false`.
+    pub rainbow_brackets: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Eq, PartialOrd, Ord)]
@@ -628,6 +630,9 @@ pub enum StatusLineElement {
 
     /// Indicator for selected register
     Register,
+
+    /// The base of current working directory
+    CurrentWorkingDirectory,
 }
 
 // Cursor shape is read and used on every rendered frame and so needs
@@ -1052,9 +1057,10 @@ impl Default for Config {
             indent_heuristic: IndentationHeuristic::default(),
             jump_label_alphabet: ('a'..='z').collect(),
             inline_diagnostics: InlineDiagnosticsConfig::default(),
-            end_of_line_diagnostics: DiagnosticFilter::Disable,
+            end_of_line_diagnostics: DiagnosticFilter::Enable(Severity::Hint),
             clipboard_provider: ClipboardProvider::default(),
             editor_config: true,
+            rainbow_brackets: false,
         }
     }
 }
@@ -1981,28 +1987,29 @@ impl Editor {
     }
 
     pub fn focus(&mut self, view_id: ViewId) {
-        let prev_id = std::mem::replace(&mut self.tree.focus, view_id);
-
-        // if leaving the view: mode should reset and the cursor should be
-        // within view
-        if prev_id != view_id {
-            self.enter_normal_mode();
-            self.ensure_cursor_in_view(view_id);
-
-            // Update jumplist selections with new document changes.
-            for (view, _focused) in self.tree.views_mut() {
-                let doc = doc_mut!(self, &view.doc);
-                view.sync_changes(doc);
-            }
-            let view = view!(self, view_id);
-            let doc = doc_mut!(self, &view.doc);
-            doc.mark_as_focused();
-            let focus_lost = self.tree.get(prev_id).doc;
-            dispatch(DocumentFocusLost {
-                editor: self,
-                doc: focus_lost,
-            });
+        if self.tree.focus == view_id {
+            return;
         }
+
+        // Reset mode to normal and ensure any pending changes are committed in the old document.
+        self.enter_normal_mode();
+        let (view, doc) = current!(self);
+        doc.append_changes_to_history(view);
+        self.ensure_cursor_in_view(view_id);
+        // Update jumplist selections with new document changes.
+        for (view, _focused) in self.tree.views_mut() {
+            let doc = doc_mut!(self, &view.doc);
+            view.sync_changes(doc);
+        }
+
+        let prev_id = std::mem::replace(&mut self.tree.focus, view_id);
+        doc_mut!(self).mark_as_focused();
+
+        let focus_lost = self.tree.get(prev_id).doc;
+        dispatch(DocumentFocusLost {
+            editor: self,
+            doc: focus_lost,
+        });
     }
 
     pub fn focus_next(&mut self) {

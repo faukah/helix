@@ -22,7 +22,8 @@ pub use typed::*;
 use helix_core::{
     char_idx_at_visual_offset,
     chars::char_is_word,
-    command_line, comment,
+    command_line::{self, Args},
+    comment,
     doc_formatter::TextFormat,
     encoding, find_workspace,
     graphemes::{self, next_grapheme_boundary},
@@ -46,6 +47,7 @@ use helix_core::{
 use helix_view::{
     document::{FormatterError, Mode, SCRATCH_BUFFER_NAME},
     editor::Action,
+    expansion,
     info::Info,
     input::KeyEvent,
     keyboard::KeyCode,
@@ -472,6 +474,8 @@ impl MappableCommand {
         smart_tab, "Insert tab if all cursors have all whitespace to their left; otherwise, run a separate command.",
         insert_tab, "Insert tab char",
         insert_newline, "Insert newline char",
+        insert_char_interactive, "Insert an interactively-chosen char",
+        append_char_interactive, "Append an interactively-chosen char",
         delete_char_backward, "Delete previous char",
         delete_char_forward, "Delete next char",
         delete_word_backward, "Delete previous word",
@@ -3197,9 +3201,11 @@ fn buffer_picker(cx: &mut Context) {
                 .into()
         }),
     ];
+    let initial_cursor = if items.len() <= 1 { 0 } else { 1 };
     let picker = Picker::new(columns, 2, items, (), |cx, meta, action| {
         cx.editor.switch(meta.id, action);
     })
+    .with_initial_cursor(initial_cursor)
     .with_preview(|editor, meta| {
         let doc = &editor.documents.get(&meta.id)?;
         let lines = doc.selections().values().next().map(|selection| {
@@ -4104,7 +4110,7 @@ fn hunk_range(hunk: Hunk, text: RopeSlice) -> Range {
 }
 
 pub mod insert {
-    use crate::events::PostInsertChar;
+    use crate::{events::PostInsertChar, key};
 
     use super::*;
     pub type Hook = fn(&Rope, &Selection, char) -> Option<Transaction>;
@@ -4183,17 +4189,64 @@ pub mod insert {
     }
 
     pub fn insert_tab(cx: &mut Context) {
+        insert_tab_impl(cx, 1)
+    }
+
+    fn insert_tab_impl(cx: &mut Context, count: usize) {
         let (view, doc) = current!(cx.editor);
         // TODO: round out to nearest indentation level (for example a line with 3 spaces should
         // indent by one to reach 4 spaces).
 
-        let indent = Tendril::from(doc.indent_style.as_str());
+        let indent = Tendril::from(doc.indent_style.as_str().repeat(count));
         let transaction = Transaction::insert(
             doc.text(),
             &doc.selection(view.id).clone().cursors(doc.text().slice(..)),
             indent,
         );
         doc.apply(&transaction, view.id);
+    }
+
+    pub fn append_char_interactive(cx: &mut Context) {
+        // Save the current mode, so we can restore it later.
+        let mode = cx.editor.mode;
+        append_mode(cx);
+        insert_selection_interactive(cx, mode);
+    }
+
+    pub fn insert_char_interactive(cx: &mut Context) {
+        let mode = cx.editor.mode;
+        insert_mode(cx);
+        insert_selection_interactive(cx, mode);
+    }
+
+    fn insert_selection_interactive(cx: &mut Context, old_mode: Mode) {
+        let count = cx.count();
+
+        // need to wait for next key
+        cx.on_next_key(move |cx, event| {
+            match event {
+                KeyEvent {
+                    code: KeyCode::Char(ch),
+                    ..
+                } => {
+                    for _ in 0..count {
+                        insert::insert_char(cx, ch)
+                    }
+                }
+                key!(Enter) => {
+                    if count != 1 {
+                        cx.editor
+                            .set_error("inserting multiple newlines not yet supported");
+                        return;
+                    }
+                    insert_newline(cx)
+                }
+                key!(Tab) => insert_tab_impl(cx, count),
+                _ => (),
+            };
+            // Restore the old mode.
+            cx.editor.mode = old_mode;
+        });
     }
 
     pub fn insert_newline(cx: &mut Context) {
@@ -5319,6 +5372,7 @@ fn rotate_selections_last(cx: &mut Context) {
     doc.set_selection(view.id, selection);
 }
 
+#[derive(Debug)]
 enum ReorderStrategy {
     RotateForward,
     RotateBackward,
@@ -5331,34 +5385,50 @@ fn reorder_selection_contents(cx: &mut Context, strategy: ReorderStrategy) {
     let text = doc.text().slice(..);
 
     let selection = doc.selection(view.id);
-    let mut fragments: Vec<_> = selection
+
+    let mut ranges: Vec<_> = selection
         .slices(text)
         .map(|fragment| fragment.chunks().collect())
         .collect();
 
-    let group = count
-        .map(|count| count.get())
-        .unwrap_or(fragments.len()) // default to rotating everything as one group
-        .min(fragments.len());
+    let rotate_by = count.map_or(1, |count| count.get().min(ranges.len()));
 
-    for chunk in fragments.chunks_mut(group) {
-        // TODO: also modify main index
-        match strategy {
-            ReorderStrategy::RotateForward => chunk.rotate_right(1),
-            ReorderStrategy::RotateBackward => chunk.rotate_left(1),
-            ReorderStrategy::Reverse => chunk.reverse(),
-        };
-    }
+    let primary_index = match strategy {
+        ReorderStrategy::RotateForward => {
+            ranges.rotate_right(rotate_by);
+            // Like `usize::wrapping_add`, but provide a custom range from `0` to `ranges.len()`
+            (selection.primary_index() + ranges.len() + rotate_by) % ranges.len()
+        }
+        ReorderStrategy::RotateBackward => {
+            ranges.rotate_left(rotate_by);
+            // Like `usize::wrapping_sub`, but provide a custom range from `0` to `ranges.len()`
+            (selection.primary_index() + ranges.len() - rotate_by) % ranges.len()
+        }
+        ReorderStrategy::Reverse => {
+            if rotate_by % 2 == 0 {
+                // nothing changed, if we reverse something an even
+                // amount of times, the output will be the same
+                return;
+            }
+            ranges.reverse();
+            // -1 to turn 1-based len into 0-based index
+            (ranges.len() - 1) - selection.primary_index()
+        }
+    };
 
     let transaction = Transaction::change(
         doc.text(),
         selection
             .ranges()
             .iter()
-            .zip(fragments)
+            .zip(ranges)
             .map(|(range, fragment)| (range.from(), range.to(), Some(fragment))),
     );
 
+    doc.set_selection(
+        view.id,
+        Selection::new(selection.ranges().into(), primary_index),
+    );
     doc.apply(&transaction, view.id);
 }
 
@@ -6010,7 +6080,7 @@ fn select_textobject(cx: &mut Context, objtype: textobject::TextObject) {
         ("e", "Data structure entry (tree-sitter)"),
         ("m", "Closest surrounding pair (tree-sitter)"),
         ("g", "Change"),
-        ("x", "X(HTML) element (tree-sitter)"),
+        ("x", "(X)HTML element (tree-sitter)"),
         (" ", "... or any character acting as a pair"),
     ];
 
@@ -6188,64 +6258,52 @@ enum ShellBehavior {
 }
 
 fn shell_pipe(cx: &mut Context) {
-    shell_prompt(cx, "pipe:".into(), ShellBehavior::Replace);
+    shell_prompt_for_behavior(cx, "pipe:".into(), ShellBehavior::Replace);
 }
 
 fn shell_pipe_to(cx: &mut Context) {
-    shell_prompt(cx, "pipe-to:".into(), ShellBehavior::Ignore);
+    shell_prompt_for_behavior(cx, "pipe-to:".into(), ShellBehavior::Ignore);
 }
 
 fn shell_insert_output(cx: &mut Context) {
-    shell_prompt(cx, "insert-output:".into(), ShellBehavior::Insert);
+    shell_prompt_for_behavior(cx, "insert-output:".into(), ShellBehavior::Insert);
 }
 
 fn shell_append_output(cx: &mut Context) {
-    shell_prompt(cx, "append-output:".into(), ShellBehavior::Append);
+    shell_prompt_for_behavior(cx, "append-output:".into(), ShellBehavior::Append);
 }
 
 fn shell_keep_pipe(cx: &mut Context) {
-    ui::prompt(
-        cx,
-        "keep-pipe:".into(),
-        Some('|'),
-        ui::completers::none,
-        move |cx, input: &str, event: PromptEvent| {
-            let shell = &cx.editor.config().shell;
-            if event != PromptEvent::Validate {
-                return;
-            }
-            if input.is_empty() {
-                return;
-            }
-            let (view, doc) = current!(cx.editor);
-            let selection = doc.selection(view.id);
+    shell_prompt(cx, "keep-pipe:".into(), |cx, args| {
+        let shell = &cx.editor.config().shell;
+        let (view, doc) = current!(cx.editor);
+        let selection = doc.selection(view.id);
 
-            let mut ranges = SmallVec::with_capacity(selection.len());
-            let old_index = selection.primary_index();
-            let mut index: Option<usize> = None;
-            let text = doc.text().slice(..);
+        let mut ranges = SmallVec::with_capacity(selection.len());
+        let old_index = selection.primary_index();
+        let mut index: Option<usize> = None;
+        let text = doc.text().slice(..);
 
-            for (i, range) in selection.ranges().iter().enumerate() {
-                let fragment = range.slice(text);
-                if let Err(err) = shell_impl(shell, input, Some(fragment.into())) {
-                    log::debug!("Shell command failed: {}", err);
-                } else {
-                    ranges.push(*range);
-                    if i >= old_index && index.is_none() {
-                        index = Some(ranges.len() - 1);
-                    }
+        for (i, range) in selection.ranges().iter().enumerate() {
+            let fragment = range.slice(text);
+            if let Err(err) = shell_impl(shell, args.join(" ").as_str(), Some(fragment.into())) {
+                log::debug!("Shell command failed: {}", err);
+            } else {
+                ranges.push(*range);
+                if i >= old_index && index.is_none() {
+                    index = Some(ranges.len() - 1);
                 }
             }
+        }
 
-            if ranges.is_empty() {
-                cx.editor.set_error("No selections remaining");
-                return;
-            }
+        if ranges.is_empty() {
+            cx.editor.set_error("No selections remaining");
+            return;
+        }
 
-            let index = index.unwrap_or_else(|| ranges.len() - 1);
-            doc.set_selection(view.id, Selection::new(ranges, index));
-        },
-    );
+        let index = index.unwrap_or_else(|| ranges.len() - 1);
+        doc.set_selection(view.id, Selection::new(ranges, index));
+    });
 }
 
 fn shell_impl(shell: &[String], cmd: &str, input: Option<Rope>) -> anyhow::Result<Tendril> {
@@ -6400,23 +6458,33 @@ fn shell(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavior) {
     view.ensure_cursor_in_view(doc, config.scrolloff);
 }
 
-fn shell_prompt(cx: &mut Context, prompt: Cow<'static, str>, behavior: ShellBehavior) {
+fn shell_prompt<F>(cx: &mut Context, prompt: Cow<'static, str>, mut callback_fn: F)
+where
+    F: FnMut(&mut compositor::Context, Args) + 'static,
+{
     ui::prompt(
         cx,
         prompt,
         Some('|'),
-        ui::completers::shell,
-        move |cx, input: &str, event: PromptEvent| {
-            if event != PromptEvent::Validate {
+        |editor, input| complete_command_args(editor, SHELL_SIGNATURE, &SHELL_COMPLETER, input, 0),
+        move |cx, input, event| {
+            if event != PromptEvent::Validate || input.is_empty() {
                 return;
             }
-            if input.is_empty() {
-                return;
+            match Args::parse(input, SHELL_SIGNATURE, true, |token| {
+                expansion::expand(cx.editor, token).map_err(|err| err.into())
+            }) {
+                Ok(args) => callback_fn(cx, args),
+                Err(err) => cx.editor.set_error(err.to_string()),
             }
-
-            shell(cx, input, &behavior);
         },
     );
+}
+
+fn shell_prompt_for_behavior(cx: &mut Context, prompt: Cow<'static, str>, behavior: ShellBehavior) {
+    shell_prompt(cx, prompt, move |cx, args| {
+        shell(cx, args.join(" ").as_str(), &behavior)
+    })
 }
 
 fn suspend(_cx: &mut Context) {
