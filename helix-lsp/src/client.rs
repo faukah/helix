@@ -4,13 +4,18 @@ use crate::{
     transport::{Payload, Transport},
     Call, Error, LanguageServerId, OffsetEncoding, Result,
 };
+use log::info;
 
 use crate::lsp::{
     self, notification::DidChangeWorkspaceFolders, CodeActionCapabilityResolveSupport,
     DidChangeWorkspaceFoldersParams, OneOf, PositionEncodingKind, SignatureHelp, Url,
     WorkspaceFolder, WorkspaceFoldersChangeEvent,
 };
-use helix_core::{find_workspace, syntax::config::LanguageServerFeature, ChangeSet, Rope};
+use helix_core::{
+    find_workspace,
+    syntax::config::{LanguageServerFeature, RootMarkers},
+    ChangeSet, Rope,
+};
 use helix_loader::VERSION_AND_GIT_HASH;
 use helix_stdx::path;
 use parking_lot::Mutex;
@@ -38,8 +43,9 @@ use tokio::{
 fn workspace_for_uri(uri: lsp::Url) -> WorkspaceFolder {
     lsp::WorkspaceFolder {
         name: uri
-            .path_segments()
-            .and_then(|mut segments| segments.next_back())
+            .path()
+            .rsplit('/')
+            .find(|segment| !segment.is_empty())
             .map(|basename| basename.to_string())
             .unwrap_or_default(),
         uri,
@@ -67,9 +73,9 @@ pub struct Client {
 impl Client {
     pub fn try_add_doc(
         self: &Arc<Self>,
-        root_markers: &[String],
+        root_markers: &RootMarkers,
         manual_roots: &[PathBuf],
-        doc_path: Option<&std::path::PathBuf>,
+        doc_path: Option<&std::path::Path>,
         may_support_workspace: bool,
     ) -> bool {
         let (workspace, workspace_is_cwd) = find_workspace();
@@ -215,6 +221,7 @@ impl Client {
         UnboundedReceiver<(LanguageServerId, Call)>,
         Arc<Notify>,
     )> {
+        info!("Starting lsp {name:?} in root {root_path:?}");
         // Resolve path to the binary
         let cmd = helix_stdx::env::which(cmd)?;
 
@@ -360,6 +367,7 @@ impl Client {
                         | CodeActionProviderCapability::Options(_),
                 )
             ),
+            LanguageServerFeature::DocumentLinks => capabilities.document_link_provider.is_some(),
             LanguageServerFeature::WorkspaceCommand => {
                 capabilities.execute_command_provider.is_some()
             }
@@ -372,6 +380,7 @@ impl Client {
                 Some(OneOf::Left(true) | OneOf::Right(_))
             ),
             LanguageServerFeature::Diagnostics => true, // there's no extra server capability
+            LanguageServerFeature::PullDiagnostics => capabilities.diagnostic_provider.is_some(),
             LanguageServerFeature::RenameSymbol => matches!(
                 capabilities.rename_provider,
                 Some(OneOf::Left(true)) | Some(OneOf::Right(_))
@@ -386,6 +395,13 @@ impl Client {
                     ColorProviderCapability::Simple(true)
                         | ColorProviderCapability::ColorProvider(_)
                         | ColorProviderCapability::Options(_)
+                )
+            ),
+            LanguageServerFeature::CallHierarchy => matches!(
+                capabilities.call_hierarchy_provider,
+                Some(
+                    CallHierarchyServerCapability::Simple(true)
+                        | CallHierarchyServerCapability::Options(_)
                 )
             ),
         }
@@ -574,6 +590,9 @@ impl Client {
                     apply_edit: Some(true),
                     symbol: Some(lsp::WorkspaceSymbolClientCapabilities {
                         dynamic_registration: Some(false),
+                        symbol_kind: Some(lsp::SymbolKindCapability {
+                            value_set: Some(lsp::SymbolKind::all()),
+                        }),
                         ..Default::default()
                     }),
                     execute_command: Some(lsp::DynamicRegistrationClientCapabilities {
@@ -595,12 +614,19 @@ impl Client {
                     }),
                     did_change_watched_files: Some(lsp::DidChangeWatchedFilesClientCapabilities {
                         dynamic_registration: Some(true),
-                        relative_pattern_support: Some(false),
+                        relative_pattern_support: Some(true),
                     }),
                     file_operations: Some(lsp::WorkspaceFileOperationsClientCapabilities {
+                        will_create: Some(true),
+                        did_create: Some(true),
                         will_rename: Some(true),
                         did_rename: Some(true),
+                        will_delete: Some(true),
+                        did_delete: Some(true),
                         ..Default::default()
+                    }),
+                    diagnostic: Some(lsp::DiagnosticWorkspaceClientCapabilities {
+                        refresh_support: Some(true),
                     }),
                     ..Default::default()
                 }),
@@ -665,6 +691,7 @@ impl Client {
                                     lsp::CodeActionKind::REFACTOR_REWRITE,
                                     lsp::CodeActionKind::SOURCE,
                                     lsp::CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
+                                    lsp::CodeActionKind::SOURCE_FIX_ALL,
                                 ]
                                 .iter()
                                 .map(|kind| kind.as_str().to_string())
@@ -678,6 +705,10 @@ impl Client {
                             properties: vec!["edit".to_owned(), "command".to_owned()],
                         }),
                         ..Default::default()
+                    }),
+                    diagnostic: Some(lsp::DiagnosticClientCapabilities {
+                        dynamic_registration: Some(false),
+                        related_document_support: Some(true),
                     }),
                     publish_diagnostics: Some(lsp::PublishDiagnosticsClientCapabilities {
                         version_support: Some(true),
@@ -693,11 +724,31 @@ impl Client {
                         dynamic_registration: Some(false),
                         resolve_support: None,
                     }),
+                    document_link: Some(lsp::DocumentLinkClientCapabilities {
+                        dynamic_registration: Some(false),
+                        tooltip_support: Some(false),
+                    }),
+                    call_hierarchy: Some(lsp::DynamicRegistrationClientCapabilities {
+                        dynamic_registration: Some(false),
+                    }),
+                    document_symbol: Some(lsp::DocumentSymbolClientCapabilities {
+                        dynamic_registration: Some(false),
+                        symbol_kind: Some(lsp::SymbolKindCapability {
+                            value_set: Some(lsp::SymbolKind::all()),
+                        }),
+                        hierarchical_document_symbol_support: Some(false),
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 }),
                 window: Some(lsp::WindowClientCapabilities {
+                    show_message: Some(lsp::ShowMessageRequestClientCapabilities {
+                        message_action_item: Some(lsp::MessageActionItemCapabilities {
+                            additional_properties_support: Some(true),
+                        }),
+                    }),
                     work_done_progress: Some(true),
-                    ..Default::default()
+                    show_document: Some(lsp::ShowDocumentClientCapabilities { support: true }),
                 }),
                 general: Some(lsp::GeneralClientCapabilities {
                     position_encodings: Some(vec![
@@ -762,6 +813,47 @@ impl Client {
         })
     }
 
+    fn file_operation_uri(path: &Path, is_dir: bool) -> Option<String> {
+        let url = if is_dir {
+            Url::from_directory_path(path)
+        } else {
+            Url::from_file_path(path)
+        };
+        Some(url.ok()?.to_string())
+    }
+
+    pub fn will_create(
+        &self,
+        path: &Path,
+        is_dir: bool,
+    ) -> Option<impl Future<Output = Result<Option<lsp::WorkspaceEdit>>>> {
+        let capabilities = self.file_operations_intests();
+        if !capabilities.will_create.has_interest(path, is_dir) {
+            return None;
+        }
+
+        let files = vec![lsp::FileCreate {
+            uri: Self::file_operation_uri(path, is_dir)?,
+        }];
+        Some(self.call_with_timeout::<lsp::request::WillCreateFiles>(
+            &lsp::CreateFilesParams { files },
+            5,
+        ))
+    }
+
+    pub fn did_create(&self, path: &Path, is_dir: bool) -> Option<()> {
+        let capabilities = self.file_operations_intests();
+        if !capabilities.did_create.has_interest(path, is_dir) {
+            return None;
+        }
+
+        let files = vec![lsp::FileCreate {
+            uri: Self::file_operation_uri(path, is_dir)?,
+        }];
+        self.notify::<lsp::notification::DidCreateFiles>(lsp::CreateFilesParams { files });
+        Some(())
+    }
+
     pub fn will_rename(
         &self,
         old_path: &Path,
@@ -772,17 +864,9 @@ impl Client {
         if !capabilities.will_rename.has_interest(old_path, is_dir) {
             return None;
         }
-        let url_from_path = |path| {
-            let url = if is_dir {
-                Url::from_directory_path(path)
-            } else {
-                Url::from_file_path(path)
-            };
-            Some(url.ok()?.to_string())
-        };
         let files = vec![lsp::FileRename {
-            old_uri: url_from_path(old_path)?,
-            new_uri: url_from_path(new_path)?,
+            old_uri: Self::file_operation_uri(old_path, is_dir)?,
+            new_uri: Self::file_operation_uri(new_path, is_dir)?,
         }];
         Some(self.call_with_timeout::<lsp::request::WillRenameFiles>(
             &lsp::RenameFilesParams { files },
@@ -795,20 +879,44 @@ impl Client {
         if !capabilities.did_rename.has_interest(new_path, is_dir) {
             return None;
         }
-        let url_from_path = |path| {
-            let url = if is_dir {
-                Url::from_directory_path(path)
-            } else {
-                Url::from_file_path(path)
-            };
-            Some(url.ok()?.to_string())
-        };
 
         let files = vec![lsp::FileRename {
-            old_uri: url_from_path(old_path)?,
-            new_uri: url_from_path(new_path)?,
+            old_uri: Self::file_operation_uri(old_path, is_dir)?,
+            new_uri: Self::file_operation_uri(new_path, is_dir)?,
         }];
         self.notify::<lsp::notification::DidRenameFiles>(lsp::RenameFilesParams { files });
+        Some(())
+    }
+
+    pub fn will_delete(
+        &self,
+        path: &Path,
+        is_dir: bool,
+    ) -> Option<impl Future<Output = Result<Option<lsp::WorkspaceEdit>>>> {
+        let capabilities = self.file_operations_intests();
+        if !capabilities.will_delete.has_interest(path, is_dir) {
+            return None;
+        }
+
+        let files = vec![lsp::FileDelete {
+            uri: Self::file_operation_uri(path, is_dir)?,
+        }];
+        Some(self.call_with_timeout::<lsp::request::WillDeleteFiles>(
+            &lsp::DeleteFilesParams { files },
+            5,
+        ))
+    }
+
+    pub fn did_delete(&self, path: &Path, is_dir: bool) -> Option<()> {
+        let capabilities = self.file_operations_intests();
+        if !capabilities.did_delete.has_interest(path, is_dir) {
+            return None;
+        }
+
+        let files = vec![lsp::FileDelete {
+            uri: Self::file_operation_uri(path, is_dir)?,
+        }];
+        self.notify::<lsp::notification::DidDeleteFiles>(lsp::DeleteFilesParams { files });
         Some(())
     }
 
@@ -1146,6 +1254,35 @@ impl Client {
         Some(self.call::<lsp::request::DocumentColor>(params))
     }
 
+    pub fn text_document_document_link(
+        &self,
+        text_document: lsp::TextDocumentIdentifier,
+        work_done_token: Option<lsp::ProgressToken>,
+    ) -> Option<impl Future<Output = Result<Option<Vec<lsp::DocumentLink>>>>> {
+        if !self.supports_feature(LanguageServerFeature::DocumentLinks) {
+            return None;
+        }
+
+        let params = lsp::DocumentLinkParams {
+            text_document,
+            work_done_progress_params: lsp::WorkDoneProgressParams { work_done_token },
+            partial_result_params: lsp::PartialResultParams::default(),
+        };
+
+        Some(self.call::<lsp::request::DocumentLinkRequest>(params))
+    }
+
+    pub fn resolve_document_link(
+        &self,
+        params: lsp::DocumentLink,
+    ) -> Option<impl Future<Output = Result<lsp::DocumentLink>>> {
+        if !self.supports_feature(LanguageServerFeature::DocumentLinks) {
+            return None;
+        }
+
+        Some(self.call::<lsp::request::DocumentLinkResolve>(params))
+    }
+
     pub fn text_document_hover(
         &self,
         text_document: lsp::TextDocumentIdentifier,
@@ -1227,6 +1364,32 @@ impl Client {
         };
 
         Some(self.call::<lsp::request::RangeFormatting>(params))
+    }
+
+    pub fn text_document_diagnostic(
+        &self,
+        text_document: lsp::TextDocumentIdentifier,
+        previous_result_id: Option<String>,
+    ) -> Option<impl Future<Output = Result<lsp::DocumentDiagnosticReportResult>>> {
+        let capabilities = self.capabilities();
+
+        // Return early if the server does not support pull diagnostic.
+        let identifier = match capabilities.diagnostic_provider.as_ref()? {
+            lsp::DiagnosticServerCapabilities::Options(cap) => cap.identifier.clone(),
+            lsp::DiagnosticServerCapabilities::RegistrationOptions(cap) => {
+                cap.diagnostic_options.identifier.clone()
+            }
+        };
+
+        let params = lsp::DocumentDiagnosticParams {
+            text_document,
+            identifier,
+            previous_result_id,
+            work_done_progress_params: lsp::WorkDoneProgressParams::default(),
+            partial_result_params: lsp::PartialResultParams::default(),
+        };
+
+        Some(self.call::<lsp::request::DocumentDiagnosticRequest>(params))
     }
 
     pub fn text_document_document_highlight(
@@ -1427,6 +1590,78 @@ impl Client {
         };
 
         Some(self.call::<lsp::request::DocumentSymbolRequest>(params))
+    }
+
+    pub fn prepare_call_hierarchy(
+        &self,
+        text_document: lsp::TextDocumentIdentifier,
+        position: lsp::Position,
+    ) -> Option<impl Future<Output = Result<Option<Vec<lsp::CallHierarchyItem>>>>> {
+        let capabilities = self.capabilities.get().unwrap();
+
+        match capabilities.call_hierarchy_provider {
+            Some(
+                lsp::CallHierarchyServerCapability::Simple(true)
+                | lsp::CallHierarchyServerCapability::Options(_),
+            ) => (),
+            _ => return None,
+        }
+
+        let params = lsp::CallHierarchyPrepareParams {
+            text_document_position_params: lsp::TextDocumentPositionParams {
+                text_document,
+                position,
+            },
+            work_done_progress_params: lsp::WorkDoneProgressParams::default(),
+        };
+
+        Some(self.call::<lsp::request::CallHierarchyPrepare>(params))
+    }
+
+    pub fn call_hierarchy_incoming(
+        &self,
+        item: lsp::CallHierarchyItem,
+    ) -> Option<impl Future<Output = Result<Option<Vec<lsp::CallHierarchyIncomingCall>>>>> {
+        let capabilities = self.capabilities.get().unwrap();
+
+        match capabilities.call_hierarchy_provider {
+            Some(
+                lsp::CallHierarchyServerCapability::Simple(true)
+                | lsp::CallHierarchyServerCapability::Options(_),
+            ) => (),
+            _ => return None,
+        }
+
+        let params = lsp::CallHierarchyIncomingCallsParams {
+            item,
+            work_done_progress_params: lsp::WorkDoneProgressParams::default(),
+            partial_result_params: lsp::PartialResultParams::default(),
+        };
+
+        Some(self.call::<lsp::request::CallHierarchyIncomingCalls>(params))
+    }
+
+    pub fn call_hierarchy_outgoing(
+        &self,
+        item: lsp::CallHierarchyItem,
+    ) -> Option<impl Future<Output = Result<Option<Vec<lsp::CallHierarchyOutgoingCall>>>>> {
+        let capabilities = self.capabilities.get().unwrap();
+
+        match capabilities.call_hierarchy_provider {
+            Some(
+                lsp::CallHierarchyServerCapability::Simple(true)
+                | lsp::CallHierarchyServerCapability::Options(_),
+            ) => (),
+            _ => return None,
+        }
+
+        let params = lsp::CallHierarchyOutgoingCallsParams {
+            item,
+            work_done_progress_params: lsp::WorkDoneProgressParams::default(),
+            partial_result_params: lsp::PartialResultParams::default(),
+        };
+
+        Some(self.call::<lsp::request::CallHierarchyOutgoingCalls>(params))
     }
 
     pub fn prepare_rename(

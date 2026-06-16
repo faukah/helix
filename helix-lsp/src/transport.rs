@@ -98,7 +98,7 @@ impl Transport {
             buffer.clear();
             if reader.read_line(buffer).await? == 0 {
                 return Err(Error::StreamClosed);
-            };
+            }
 
             // debug!("<- header {:?}", buffer);
 
@@ -133,12 +133,14 @@ impl Transport {
 
         info!("{language_server_name} <- {msg}");
 
-        // try parsing as output (server response) or call (server request)
-        let output: serde_json::Result<ServerMessage> = serde_json::from_str(msg);
+        // NOTE: We avoid using `?` here, since it would return early on error
+        // and skip clearing `content`. By returning the result directly instead,
+        // we ensure `content.clear()` is always called.
+        let output = sonic_rs::from_slice(content).map_err(Into::into);
 
         content.clear();
 
-        Ok(output?)
+        output
     }
 
     async fn recv_server_error(
@@ -343,6 +345,11 @@ impl Transport {
         let mut pending_messages: Vec<Payload> = Vec::new();
         let mut is_pending = true;
 
+        // Pin outside the loop to avoid cancellation-safety issue:
+        // recreating `notified()` inside `select!` can lose the permit.
+        let notified = initialize_notify.notified();
+        tokio::pin!(notified);
+
         // Determine if a message is allowed to be sent early
         fn is_initialize(payload: &Payload) -> bool {
             use lsp::{
@@ -373,7 +380,7 @@ impl Transport {
         loop {
             tokio::select! {
                 biased;
-                _ = initialize_notify.notified() => { // TODO: notified is technically not cancellation safe
+                _ = &mut notified, if is_pending => {
                     // server successfully initialized
                     is_pending = false;
 

@@ -51,6 +51,7 @@
   "@"
   ".."
   "..="
+  "..." ; variadic `...` in extern fn signatures
   "'"
 ] @operator
 
@@ -79,17 +80,14 @@
 ; Types
 ; -------
 
-(type_parameters
-  (type_identifier) @type.parameter)
-(constrained_type_parameter
-  left: (type_identifier) @type.parameter)
-(optional_type_parameter
+(type_parameter
   name: (type_identifier) @type.parameter)
 ((type_arguments (type_identifier) @constant)
  (#match? @constant "^[A-Z_]+$"))
 (type_arguments (type_identifier) @type)
-; `_` in `(_, _)`
-(tuple_struct_pattern "_" @comment.unused)
+; `_` placeholder token in any pattern position:
+; `let _ =`, `match { _ => }`, `|_|`, `fn f(_: T)`, `(_, _)`, `[_, x]`
+("_" @comment.unused)
 ; `_` in `Vec<_>`
 ((type_arguments (type_identifier) @comment.unused)
  (#eq? @comment.unused "_"))
@@ -116,6 +114,7 @@
 ; Comments
 ; -------
 
+(shebang) @comment
 (line_comment) @comment.line
 (block_comment) @comment.block
 
@@ -211,6 +210,23 @@
 (closure_parameters
 	(identifier) @variable.parameter)
 
+; Mutable variables
+
+(let_declaration
+  (mutable_specifier)
+  pattern: (identifier) @variable.mutable)
+(mut_pattern
+  (mutable_specifier)
+  (identifier) @variable.mutable)
+
+(parameter
+  (mutable_specifier)
+  pattern: (identifier) @variable.parameter.mutable)
+
+(self_parameter
+  (mutable_specifier)
+  (self) @variable.builtin.mutable)
+
 ; -------
 ; Keywords
 ; -------
@@ -243,10 +259,6 @@
 
 (type_cast_expression "as" @keyword.operator)
 
-((generic_type
-    type: (type_identifier) @keyword)
- (#eq? @keyword "use"))
-
 [
   (crate)
   (super)
@@ -277,7 +289,7 @@
 
 "let" @keyword.storage
 "fn" @keyword.function
-"unsafe" @keyword.special
+"unsafe" @keyword.storage.modifier
 "macro_rules!" @function.macro
 
 (mutable_specifier) @keyword.storage.modifier.mut
@@ -293,8 +305,6 @@
   "move"
   "dyn"
 ] @keyword.storage.modifier
-
-; TODO: variable.mut to highlight mutable identifiers via locals.scm
 
 ; ---
 ; Remaining Paths
@@ -332,8 +342,9 @@
     ((identifier) @function)
     (scoped_identifier
       name: (identifier) @function)
+    ; method call `obj.method()` — consistent with the generic_function case below
     (field_expression
-      field: (field_identifier) @function)
+      field: (field_identifier) @function.method)
   ])
 (generic_function
   function: [
@@ -422,6 +433,11 @@
   ((identifier) @constructor)
   ((identifier) @constructor)
   (#match? @constructor "^[A-Z]"))
+
+(match_pattern
+  (scoped_identifier
+    name: ((identifier) @type.enum.variant
+      (#match? @type.enum.variant "^[A-Z]"))))
 
 ; ---
 ; Macros
